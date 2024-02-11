@@ -1,6 +1,6 @@
 use std::{
     borrow::Borrow,
-    io::Cursor,
+    io::{Cursor, Seek},
     net::SocketAddr,
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -9,32 +9,26 @@ use std::{
 use binrw::{binread, binrw, binwrite, BinRead, BinReaderExt, BinResult, BinWrite, BinWriterExt};
 use byteorder::WriteBytesExt;
 use eyre::{eyre, Report, Result};
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use tokio::{
-    net::{TcpListener, TcpStream},
-    spawn,
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpListener, TcpStream,
+    },
+    select, spawn,
 };
 use tokio_util::{
     bytes::{Buf, BytesMut},
-    codec::{Decoder, Encoder, FramedRead},
+    codec::{Decoder, Encoder, FramedRead, FramedWrite},
 };
-use tracing::info;
+use tracing::{debug, error, info, instrument, Instrument, Level, Subscriber};
+use tracing_subscriber::{fmt::format::FmtSpan, util::SubscriberInitExt};
 
-struct Configuration {
-    addr: String,
-}
-
-struct Connection {
-    conf: Arc<Configuration>,
-    sock: TcpStream,
-    client_addr: SocketAddr,
-    state: ConnectionState,
-}
-
-enum ConnectionState {
-    Handshake,
-    Login,
-    Ping,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Handshaking,
+    Status,
+    Disconnected,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -312,9 +306,64 @@ enum C2SHandshakingPacketBody {
         protocol_version: VarInt,
         server_address: SizedString,
         server_port: u16,
-        #[brw(assert(*next_state == 0x01 || *next_state == 0x02))]
-        next_state: VarInt,
+        next_state: HandshakeNextState,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[binread]
+#[brw(big)]
+enum HandshakeNextState {
+    #[brw(magic(b"\x01"))]
+    Status,
+    #[brw(magic(b"\x02"))]
+    Login,
+}
+
+struct HandshakingPacketCodec;
+
+impl Decoder for HandshakingPacketCodec {
+    type Item = C2SHandshakingPacket;
+    type Error = Report;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
+        let mut reader = Cursor::new(&src[..]);
+        let result = reader
+            .read_be::<Self::Item>()
+            .map(|packet| Some(packet))
+            .or_else(|e| match e {
+                binrw::Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+                binrw::Error::Backtrace(backtrace) => match &*backtrace.error {
+                    binrw::Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        Ok(None)
+                    }
+                    _ => Err(eyre!(backtrace)),
+                },
+                e => Err(eyre!(e)),
+            });
+        src.advance(reader.position() as usize);
+        result
+    }
+}
+
+#[tokio::test]
+async fn handshaking_packet_codec() {
+    let buffer =
+        Cursor::new(b"\x10\x00\xfd\x05\x09\x6c\x6f\x63\x61\x6c\x68\x6f\x73\x74\x63\xdd\x01");
+    let mut framed = FramedRead::new(buffer, HandshakingPacketCodec);
+    assert_eq!(
+        framed.next().await.unwrap().unwrap(),
+        C2SHandshakingPacket {
+            length: VarInt(16),
+            body: C2SHandshakingPacketBody::Handshake {
+                protocol_version: VarInt(765),
+                server_address: SizedString("localhost".to_string()),
+                server_port: 25565,
+                next_state: HandshakeNextState::Status,
+            }
+        }
+    );
+    assert!(framed.next().await.is_none());
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -355,57 +404,194 @@ enum C2SStatusPacketBody {
     PingRequest { payload: i64 },
 }
 
-struct HandshakingPacketCodec;
+struct StatusPacketCodec;
 
-impl Decoder for HandshakingPacketCodec {
-    type Item = C2SHandshakingPacket;
+impl Decoder for StatusPacketCodec {
+    type Item = C2SStatusPacket;
     type Error = Report;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         let mut reader = Cursor::new(&src[..]);
-        reader
-            .read_be::<C2SHandshakingPacket>()
+        let result = Self::Item::read(&mut reader)
             .map(|packet| Some(packet))
             .or_else(|e| match e {
-                binrw::Error::Io(e) => Err(eyre!(e)),
-                binrw::Error::Backtrace(backtrace) => match backtrace.error.borrow() {
-                    binrw::Error::Io(_) => Err(eyre!(backtrace)),
+                binrw::Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+                binrw::Error::Backtrace(backtrace) => match &*backtrace.error {
+                    binrw::Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        Ok(None)
+                    }
                     _ => Err(eyre!(backtrace)),
                 },
                 e => Err(eyre!(e)),
-            })
+            });
+        src.advance(reader.position() as usize);
+        result
+    }
+}
+
+impl Encoder<S2CStatusPacket> for StatusPacketCodec {
+    type Error = Report;
+
+    fn encode(&mut self, item: S2CStatusPacket, dst: &mut BytesMut) -> Result<()> {
+        let mut writer = Cursor::new(Vec::new());
+        item.write(&mut writer)?;
+        dst.extend(writer.into_inner());
+        Ok(())
     }
 }
 
 #[tokio::test]
-async fn handshaking_packet_codec() {
-    let buffer =
-        Cursor::new(b"\x10\x00\xfd\x05\x09\x6c\x6f\x63\x61\x6c\x68\x6f\x73\x74\x63\xdd\x01");
-    let mut framed = FramedRead::new(buffer, HandshakingPacketCodec);
-    let result = framed.next().await.unwrap().unwrap();
+async fn status_packet_codec() {
+    let buffer = Cursor::new(b"\x01\x00");
+    let mut framed = FramedRead::new(buffer, StatusPacketCodec);
     assert_eq!(
-        result,
-        C2SHandshakingPacket {
-            length: VarInt(16),
-            body: C2SHandshakingPacketBody::Handshake {
-                protocol_version: VarInt(765),
-                server_address: SizedString("localhost".to_string()),
-                server_port: 25565,
-                next_state: VarInt(1)
-            }
+        framed.next().await.unwrap().unwrap(),
+        C2SStatusPacket {
+            length: VarInt(1),
+            body: C2SStatusPacketBody::StatusRequest {}
         }
+    );
+    assert!(framed.next().await.is_none());
+
+    let mut buffer = Cursor::new(b"aaa".to_vec());
+    buffer.advance(buffer.remaining());
+    assert_eq!(buffer.position() as usize, b"aaa".len());
+    let mut framed = FramedWrite::new(buffer, StatusPacketCodec);
+    framed
+        .send(S2CStatusPacket {
+            length: VarInt(8),
+            body: S2CStatusPacketBody::PingResponse { payload: 0 },
+        })
+        .await
+        .unwrap();
+    let buffer = framed.into_inner();
+    assert_eq!(
+        buffer.position() as usize,
+        b"aaa\x08\x01\x00\x00\x00\x00\x00\x00\x00\x00".len()
+    );
+    assert_eq!(
+        buffer.into_inner(),
+        b"aaa\x08\x01\x00\x00\x00\x00\x00\x00\x00\x00"
     );
 }
 
+#[derive(Debug)]
+struct Configuration {
+    addr: String,
+}
+
+#[derive(Debug)]
+struct Connection {
+    conf: Arc<Configuration>,
+    c2s: OwnedReadHalf,
+    s2c: OwnedWriteHalf,
+    client_addr: SocketAddr,
+    state: State,
+}
+
+#[instrument(level = "debug", name = "conn", skip_all, fields(client = client_addr.to_string()))]
 async fn process_connection(conf: Arc<Configuration>, sock: TcpStream, client_addr: SocketAddr) {
-    let conn = Connection {
+    let (c2s, s2c) = sock.into_split();
+    let mut conn = Connection {
         conf,
-        sock,
+        c2s,
+        s2c,
         client_addr,
-        state: ConnectionState::Handshake,
+        state: State::Handshaking,
     };
-    info!("Connected from {}", conn.client_addr);
-    loop {}
+    info!("connected from {}", conn.client_addr);
+    loop {
+        conn = match conn.state {
+            State::Handshaking => state_handshaking(conn).await,
+            State::Status => state_status(conn).await,
+            State::Disconnected => break,
+        }
+    }
+    info!("disconnected from {}", conn.client_addr);
+}
+
+#[instrument(level = "info", name = "handshaking", skip_all)]
+async fn state_handshaking(conn: Connection) -> Connection {
+    let state;
+    let mut c2s_framed = FramedRead::new(conn.c2s, HandshakingPacketCodec);
+    loop {
+        select! {
+            result = c2s_framed.next() => {
+                match result {
+                    Some(Ok(packet)) => {
+                        debug!("received c2s packet {:?}", packet.body);
+                        match packet.body {
+                            C2SHandshakingPacketBody::Handshake { protocol_version, server_address, server_port, next_state } => {
+                                match next_state {
+                                    HandshakeNextState::Status => {
+                                        info!("client ping");
+                                        state = State::Status;
+                                        break;
+                                    },
+                                    HandshakeNextState::Login => {
+                                        info!("client tries to login");
+                                        state = State::Disconnected;
+                                        break;
+                                    },
+                                }
+                            },
+                        }
+                    }
+                    Some(Err(e)) => {
+                        error!("error reading c2s packet: {}", e);
+                        state = State::Disconnected;
+                        break;
+                    },
+                    None => {
+                        state = State::Disconnected;
+                        break;
+                    },
+                }
+            }
+        }
+    }
+    Connection {
+        c2s: c2s_framed.into_inner(),
+        state,
+        ..conn
+    }
+}
+
+#[instrument(level = "info", name = "status", skip_all)]
+async fn state_status(conn: Connection) -> Connection {
+    let state;
+    let mut c2s_framed = FramedRead::new(conn.c2s, StatusPacketCodec);
+    let mut s2c_framed = FramedWrite::new(conn.s2c, StatusPacketCodec);
+    loop {
+        select! {
+            result = c2s_framed.next() => {
+                match result {
+                    Some(Ok(packet)) => {
+                        debug!("received c2s packet {:?}", packet.body);
+                        match packet.body {
+                            C2SStatusPacketBody::StatusRequest {  } => todo!(),
+                            C2SStatusPacketBody::PingRequest { payload } => todo!(),
+                        }
+                    }
+                    Some(Err(e)) => {
+                        error!("error reading c2s packet: {}", e);
+                        state = State::Disconnected;
+                        break;
+                    },
+                    None => {
+                        state = State::Disconnected;
+                        break;
+                    },
+                }
+            }
+        }
+    }
+    Connection {
+        c2s: c2s_framed.into_inner(),
+        s2c: s2c_framed.into_inner(),
+        state,
+        ..conn
+    }
 }
 
 #[tokio::main]
@@ -416,13 +602,14 @@ async fn main() -> Result<()> {
     let conf = Arc::new(conf);
     tracing_subscriber::fmt()
         .with_max_level(if cfg!(debug_assertions) {
-            tracing::Level::DEBUG
+            Level::TRACE
         } else {
-            tracing::Level::INFO
+            Level::INFO
         })
         .init();
+    debug!("starting up");
     let listener = TcpListener::bind(conf.addr.as_str()).await?;
-    info!("Listening on {}", conf.addr.as_str());
+    info!("listening on {}", conf.addr.as_str());
     loop {
         let (sock, client_addr) = listener.accept().await?;
         spawn(process_connection(conf.clone(), sock, client_addr));
