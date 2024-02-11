@@ -3,19 +3,19 @@ use std::{
     io::{Cursor, Seek},
     net::SocketAddr,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::Arc, time::Duration,
 };
 
 use binrw::{binread, binrw, binwrite, BinRead, BinReaderExt, BinResult, BinWrite, BinWriterExt};
 use byteorder::WriteBytesExt;
 use eyre::{bail, eyre, Report, Result};
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use tokio::{
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    select, spawn,
+    select, spawn, time::sleep,
 };
 use tokio_util::{
     bytes::{Buf, BytesMut},
@@ -249,7 +249,7 @@ fn sized_string_parser() -> BinResult<String> {
 #[binrw::writer(writer)]
 fn sized_string_writer(value: &String) -> BinResult<()> {
     writer.write_be(&VarInt(value.len() as i32))?;
-    writer.write(value.as_bytes())?;
+    writer.write_all(value.as_bytes())?;
     Ok(())
 }
 
@@ -293,8 +293,9 @@ macro_rules! impl_decoder {
         impl Decoder for $type {
             type Item = $item;
             type Error = Report;
-        
+
             fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
+                debug!("decode: {:?}", src);
                 let mut reader = Cursor::new(&src[..]);
                 let length = match VarInt::read(&mut reader) {
                     Ok(v) => v,
@@ -313,7 +314,7 @@ macro_rules! impl_decoder {
                 if length < 0 {
                     bail!("packet length is negative");
                 }
-                if length > (1<<21) - 1 {
+                if length > (1 << 21) - 1 {
                     bail!("packet too large");
                 }
                 let length = length as usize;
@@ -322,7 +323,7 @@ macro_rules! impl_decoder {
                 }
                 // length of length field
                 let length_length = reader.position() as usize;
-        
+
                 let mut reader = Cursor::new(&src[length_length..length_length + length]);
                 let result = match $body::read(&mut reader) {
                     Ok(v) => v,
@@ -340,10 +341,11 @@ macro_rules! impl_decoder {
                 if reader.has_remaining() {
                     bail!("packet length does not match: extra bytes");
                 }
+                debug!("src.advance: {}", length_length + length);
                 src.advance(length_length + length);
                 Ok(Some($item {
                     length,
-                    body: result 
+                    body: result,
                 }))
             }
         }
@@ -354,12 +356,12 @@ macro_rules! impl_encoder {
     ($type:ident, $item:ident) => {
         impl Encoder<$item> for $type {
             type Error = Report;
-        
+
             fn encode(&mut self, item: $item, dst: &mut BytesMut) -> Result<()> {
                 let mut writer = Cursor::new(Vec::new());
                 item.write(&mut writer)?;
                 let length = writer.position() as usize;
-                if length > (1<<21) - 1 {
+                if length > (1 << 21) - 1 {
                     bail!("packet too large");
                 }
                 let mut length_writer = Cursor::new(Vec::new());
@@ -402,7 +404,11 @@ enum HandshakeNextState {
 }
 
 struct HandshakingPacketCodec;
-impl_decoder!(HandshakingPacketCodec, C2SHandshakingPacket, C2SHandshakingPacketBody);
+impl_decoder!(
+    HandshakingPacketCodec,
+    C2SHandshakingPacket,
+    C2SHandshakingPacketBody
+);
 
 #[tokio::test]
 async fn handshaking_packet_codec() {
@@ -446,7 +452,7 @@ struct C2SStatusPacket {
 enum C2SStatusPacketBody {
     #[brw(magic(b"\x00"))]
     StatusRequest {},
-    #[brw(magic(b"\x00"))]
+    #[brw(magic(b"\x01"))]
     PingRequest { payload: i64 },
 }
 
@@ -502,6 +508,9 @@ struct Connection {
 
 #[instrument(level = "debug", name = "conn", skip_all, fields(client = client_addr.to_string()))]
 async fn process_connection(conf: Arc<Configuration>, sock: TcpStream, client_addr: SocketAddr) {
+    if let Err(_) = sock.set_nodelay(true) {
+        error!("failed to set nodelay");
+    }
     let (c2s, s2c) = sock.into_split();
     let mut conn = Connection {
         conf,
@@ -510,21 +519,73 @@ async fn process_connection(conf: Arc<Configuration>, sock: TcpStream, client_ad
         client_addr,
         state: State::Handshaking,
     };
-    info!("connected from {}", conn.client_addr);
+    info!("connected from {}", client_addr);
     loop {
-        conn = match conn.state {
+        debug!("state: {:?}", conn.state);
+        conn = match match conn.state {
             State::Handshaking => state_handshaking(conn).await,
             State::Status => state_status(conn).await,
             State::Disconnected => break,
+        } {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!("unexpected error: {}", e);
+                break;
+            }
         }
     }
-    info!("disconnected from {}", conn.client_addr);
+    info!("disconnected with {}", client_addr);
 }
 
 #[instrument(level = "info", name = "handshaking", skip_all)]
-async fn state_handshaking(conn: Connection) -> Connection {
+async fn state_handshaking(conn: Connection) -> Result<Connection> {
     let state;
     let mut c2s_framed = FramedRead::new(conn.c2s, HandshakingPacketCodec);
+    select! {
+        result = c2s_framed.next() => {
+            match result {
+                Some(Ok(packet)) => {
+                    debug!("received c2s packet {:?}", packet.body);
+                    match packet.body {
+                        C2SHandshakingPacketBody::Handshake { protocol_version, server_address, server_port, next_state } => {
+                            match next_state {
+                                HandshakeNextState::Status => {
+                                    info!("client ping");
+                                    state = State::Status;
+                                },
+                                HandshakeNextState::Login => {
+                                    info!("client attempts to login");
+                                    state = State::Disconnected;
+                                },
+                            }
+                        },
+                    }
+                }
+                Some(Err(e)) => {
+                    bail!("error reading c2s packet: {}", e);
+                },
+                None => {
+                    state = State::Disconnected;
+                },
+            }
+        }
+    }
+    sleep(Duration::from_millis(100)).await;
+    // FIXME: remaining data is not preserved while calling .into_inner()
+    let inner = c2s_framed.into_inner();
+    info!("inner.readable() = {:?}", inner.readable().now_or_never());
+    Ok(Connection {
+        c2s: inner,
+        state,
+        ..conn
+    })
+}
+
+#[instrument(level = "info", name = "status", skip_all)]
+async fn state_status(conn: Connection) -> Result<Connection> {
+    let state;
+    let mut c2s_framed = FramedRead::new(conn.c2s, StatusPacketCodec);
+    let mut s2c_framed = FramedWrite::new(conn.s2c, StatusPacketCodec);
     loop {
         select! {
             result = c2s_framed.next() => {
@@ -532,19 +593,11 @@ async fn state_handshaking(conn: Connection) -> Connection {
                     Some(Ok(packet)) => {
                         debug!("received c2s packet {:?}", packet.body);
                         match packet.body {
-                            C2SHandshakingPacketBody::Handshake { protocol_version, server_address, server_port, next_state } => {
-                                match next_state {
-                                    HandshakeNextState::Status => {
-                                        info!("client ping");
-                                        state = State::Status;
-                                        break;
-                                    },
-                                    HandshakeNextState::Login => {
-                                        info!("client tries to login");
-                                        state = State::Disconnected;
-                                        break;
-                                    },
-                                }
+                            C2SStatusPacketBody::StatusRequest {} => {
+                                s2c_framed.send(S2CStatusPacket::StatusResponse { json_response: SizedString(r#"{"version":{"name":"Minecraft: Dummy Edition","protocol":765},"players":{"max":-2147483648,"online":-2147483648,"sample":[]},"description":{"text":"Minecraft: Dummy Edition"},"enforcesSecureChat":false,"previewsChat":true}"#.to_string()) }).await?;
+                            },
+                            C2SStatusPacketBody::PingRequest { payload } => {
+                                s2c_framed.send(S2CStatusPacket::PingResponse { payload }).await?;
                             },
                         }
                     }
@@ -561,48 +614,12 @@ async fn state_handshaking(conn: Connection) -> Connection {
             }
         }
     }
-    Connection {
-        c2s: c2s_framed.into_inner(),
-        state,
-        ..conn
-    }
-}
-
-#[instrument(level = "info", name = "status", skip_all)]
-async fn state_status(conn: Connection) -> Connection {
-    let state;
-    let mut c2s_framed = FramedRead::new(conn.c2s, StatusPacketCodec);
-    let mut s2c_framed = FramedWrite::new(conn.s2c, StatusPacketCodec);
-    loop {
-        select! {
-            result = c2s_framed.next() => {
-                match result {
-                    Some(Ok(packet)) => {
-                        debug!("received c2s packet {:?}", packet.body);
-                        match packet.body {
-                            C2SStatusPacketBody::StatusRequest {  } => todo!(),
-                            C2SStatusPacketBody::PingRequest { payload } => todo!(),
-                        }
-                    }
-                    Some(Err(e)) => {
-                        error!("error reading c2s packet: {}", e);
-                        state = State::Disconnected;
-                        break;
-                    },
-                    None => {
-                        state = State::Disconnected;
-                        break;
-                    },
-                }
-            }
-        }
-    }
-    Connection {
+    Ok(Connection {
         c2s: c2s_framed.into_inner(),
         s2c: s2c_framed.into_inner(),
         state,
         ..conn
-    }
+    })
 }
 
 #[tokio::main]
@@ -611,13 +628,20 @@ async fn main() -> Result<()> {
         addr: "127.0.0.1:25565".to_string(),
     };
     let conf = Arc::new(conf);
-    tracing_subscriber::fmt()
-        .with_max_level(if cfg!(debug_assertions) {
-            Level::TRACE
-        } else {
-            Level::INFO
-        })
-        .init();
+    if cfg!(debug_assertions) {
+        tracing_subscriber::fmt()
+            .with_max_level(Level::TRACE)
+            .with_target(true)
+            .with_span_events(FmtSpan::ACTIVE)
+            .with_file(true)
+            .with_line_number(true)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .with_target(false)
+            .init();
+    }
     debug!("starting up");
     let listener = TcpListener::bind(conf.addr.as_str()).await?;
     info!("listening on {}", conf.addr.as_str());
