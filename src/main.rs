@@ -8,7 +8,7 @@ use std::{
 
 use binrw::{binread, binrw, binwrite, BinRead, BinReaderExt, BinResult, BinWrite, BinWriterExt};
 use byteorder::WriteBytesExt;
-use eyre::{eyre, Report, Result};
+use eyre::{bail, eyre, Report, Result};
 use futures::{SinkExt, StreamExt};
 use tokio::{
     net::{
@@ -288,12 +288,93 @@ fn sized_string() {
     );
 }
 
+macro_rules! impl_decoder {
+    ($type:ident, $item:ident, $body:ident) => {
+        impl Decoder for $type {
+            type Item = $item;
+            type Error = Report;
+        
+            fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
+                let mut reader = Cursor::new(&src[..]);
+                let length = match VarInt::read(&mut reader) {
+                    Ok(v) => v,
+                    Err(binrw::Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        return Ok(None);
+                    }
+                    Err(binrw::Error::Backtrace(backtrace)) => match &*backtrace.error {
+                        binrw::Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            return Ok(None);
+                        }
+                        _ => Err(binrw::Error::Backtrace(backtrace))?,
+                    },
+                    Err(e) => Err(e)?,
+                };
+                let length = *length;
+                if length < 0 {
+                    bail!("packet length is negative");
+                }
+                if length > (1<<21) - 1 {
+                    bail!("packet too large");
+                }
+                let length = length as usize;
+                if reader.remaining() < length {
+                    return Ok(None);
+                }
+                // length of length field
+                let length_length = reader.position() as usize;
+        
+                let mut reader = Cursor::new(&src[length_length..length_length + length]);
+                let result = match $body::read(&mut reader) {
+                    Ok(v) => v,
+                    Err(binrw::Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        bail!("packet length does not match: unexpected eof");
+                    }
+                    Err(binrw::Error::Backtrace(backtrace)) => match &*backtrace.error {
+                        binrw::Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            bail!("packet length does not match: unexpected eof");
+                        }
+                        _ => Err(binrw::Error::Backtrace(backtrace))?,
+                    },
+                    Err(e) => Err(e)?,
+                };
+                if reader.has_remaining() {
+                    bail!("packet length does not match: extra bytes");
+                }
+                src.advance(length_length + length);
+                Ok(Some($item {
+                    length,
+                    body: result 
+                }))
+            }
+        }
+    };
+}
+
+macro_rules! impl_encoder {
+    ($type:ident, $item:ident) => {
+        impl Encoder<$item> for $type {
+            type Error = Report;
+        
+            fn encode(&mut self, item: $item, dst: &mut BytesMut) -> Result<()> {
+                let mut writer = Cursor::new(Vec::new());
+                item.write(&mut writer)?;
+                let length = writer.position() as usize;
+                if length > (1<<21) - 1 {
+                    bail!("packet too large");
+                }
+                let mut length_writer = Cursor::new(Vec::new());
+                VarInt(length as i32).write(&mut length_writer)?;
+                dst.extend(length_writer.into_inner());
+                dst.extend(writer.into_inner());
+                Ok(())
+            }
+        }
+    };
+}
+
 #[derive(Debug, Clone, PartialEq)]
-#[binread]
-#[brw(big)]
 struct C2SHandshakingPacket {
-    #[brw(assert(*length > 0 && *length < (1<<21) - 1))]
-    length: VarInt,
+    length: usize,
     body: C2SHandshakingPacketBody,
 }
 
@@ -321,30 +402,7 @@ enum HandshakeNextState {
 }
 
 struct HandshakingPacketCodec;
-
-impl Decoder for HandshakingPacketCodec {
-    type Item = C2SHandshakingPacket;
-    type Error = Report;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
-        let mut reader = Cursor::new(&src[..]);
-        let result = reader
-            .read_be::<Self::Item>()
-            .map(|packet| Some(packet))
-            .or_else(|e| match e {
-                binrw::Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-                binrw::Error::Backtrace(backtrace) => match &*backtrace.error {
-                    binrw::Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        Ok(None)
-                    }
-                    _ => Err(eyre!(backtrace)),
-                },
-                e => Err(eyre!(e)),
-            });
-        src.advance(reader.position() as usize);
-        result
-    }
-}
+impl_decoder!(HandshakingPacketCodec, C2SHandshakingPacket, C2SHandshakingPacketBody);
 
 #[tokio::test]
 async fn handshaking_packet_codec() {
@@ -354,7 +412,7 @@ async fn handshaking_packet_codec() {
     assert_eq!(
         framed.next().await.unwrap().unwrap(),
         C2SHandshakingPacket {
-            length: VarInt(16),
+            length: 16,
             body: C2SHandshakingPacketBody::Handshake {
                 protocol_version: VarInt(765),
                 server_address: SizedString("localhost".to_string()),
@@ -369,16 +427,7 @@ async fn handshaking_packet_codec() {
 #[derive(Debug, Clone, PartialEq)]
 #[binwrite]
 #[brw(big)]
-struct S2CStatusPacket {
-    #[brw(assert(**length > 0 && **length < (1<<21) - 1))]
-    length: VarInt,
-    body: S2CStatusPacketBody,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[binwrite]
-#[brw(big)]
-enum S2CStatusPacketBody {
+enum S2CStatusPacket {
     #[brw(magic(b"\x00"))]
     StatusResponse { json_response: SizedString },
     #[brw(magic(b"\x01"))]
@@ -386,11 +435,8 @@ enum S2CStatusPacketBody {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[binread]
-#[brw(big)]
 struct C2SStatusPacket {
-    #[brw(assert(*length > 0 && *length < (1<<21) - 1))]
-    length: VarInt,
+    length: usize,
     body: C2SStatusPacketBody,
 }
 
@@ -405,40 +451,8 @@ enum C2SStatusPacketBody {
 }
 
 struct StatusPacketCodec;
-
-impl Decoder for StatusPacketCodec {
-    type Item = C2SStatusPacket;
-    type Error = Report;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
-        let mut reader = Cursor::new(&src[..]);
-        let result = Self::Item::read(&mut reader)
-            .map(|packet| Some(packet))
-            .or_else(|e| match e {
-                binrw::Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-                binrw::Error::Backtrace(backtrace) => match &*backtrace.error {
-                    binrw::Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        Ok(None)
-                    }
-                    _ => Err(eyre!(backtrace)),
-                },
-                e => Err(eyre!(e)),
-            });
-        src.advance(reader.position() as usize);
-        result
-    }
-}
-
-impl Encoder<S2CStatusPacket> for StatusPacketCodec {
-    type Error = Report;
-
-    fn encode(&mut self, item: S2CStatusPacket, dst: &mut BytesMut) -> Result<()> {
-        let mut writer = Cursor::new(Vec::new());
-        item.write(&mut writer)?;
-        dst.extend(writer.into_inner());
-        Ok(())
-    }
-}
+impl_decoder!(StatusPacketCodec, C2SStatusPacket, C2SStatusPacketBody);
+impl_encoder!(StatusPacketCodec, S2CStatusPacket);
 
 #[tokio::test]
 async fn status_packet_codec() {
@@ -447,7 +461,7 @@ async fn status_packet_codec() {
     assert_eq!(
         framed.next().await.unwrap().unwrap(),
         C2SStatusPacket {
-            length: VarInt(1),
+            length: 1,
             body: C2SStatusPacketBody::StatusRequest {}
         }
     );
@@ -458,20 +472,17 @@ async fn status_packet_codec() {
     assert_eq!(buffer.position() as usize, b"aaa".len());
     let mut framed = FramedWrite::new(buffer, StatusPacketCodec);
     framed
-        .send(S2CStatusPacket {
-            length: VarInt(8),
-            body: S2CStatusPacketBody::PingResponse { payload: 0 },
-        })
+        .send(S2CStatusPacket::PingResponse { payload: 0 })
         .await
         .unwrap();
     let buffer = framed.into_inner();
     assert_eq!(
         buffer.position() as usize,
-        b"aaa\x08\x01\x00\x00\x00\x00\x00\x00\x00\x00".len()
+        b"aaa\x09\x01\x00\x00\x00\x00\x00\x00\x00\x00".len()
     );
     assert_eq!(
         buffer.into_inner(),
-        b"aaa\x08\x01\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"aaa\x09\x01\x00\x00\x00\x00\x00\x00\x00\x00"
     );
 }
 
