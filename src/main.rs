@@ -1,30 +1,27 @@
 use std::{
-    borrow::Borrow,
-    io::{Cursor, Seek},
+    fmt::Display,
+    io::Cursor,
     net::SocketAddr,
     ops::{Deref, DerefMut},
     sync::Arc,
-    time::Duration,
 };
 
 use binrw::{binread, binrw, binwrite, BinRead, BinReaderExt, BinResult, BinWrite, BinWriterExt};
 use byteorder::WriteBytesExt;
-use eyre::{bail, eyre, Report, Result};
-use futures::{FutureExt, SinkExt, StreamExt};
+use eyre::{bail, Report, Result};
+use futures::{SinkExt, StreamExt};
 use tokio::{
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpListener, TcpStream,
-    },
+    net::{TcpListener, TcpStream},
     select, spawn,
-    time::sleep,
 };
+#[cfg(test)]
+use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::{
     bytes::{Buf, BytesMut},
-    codec::{Decoder, Encoder, Framed, FramedRead, FramedWrite},
+    codec::{Decoder, Encoder, Framed},
 };
-use tracing::{debug, error, info, instrument, Instrument, Level, Subscriber};
-use tracing_subscriber::{fmt::format::FmtSpan, util::SubscriberInitExt};
+use tracing::{debug, error, info, instrument, Level};
+use tracing_subscriber::fmt::format::FmtSpan;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 #[binrw]
@@ -225,6 +222,12 @@ impl Deref for SizedString {
 impl DerefMut for SizedString {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+impl Display for SizedString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", **self)
     }
 }
 
@@ -562,18 +565,23 @@ async fn login_packet_codec() {
 }
 
 #[derive(Debug)]
-struct Configuration {
-    addr: String,
+pub struct Configuration {
+    pub addr: String,
 }
 
 #[derive(Debug)]
-struct Connection {
-    conf: Arc<Configuration>,
-    client_addr: SocketAddr,
+pub struct Connection {
+    pub conf: Arc<Configuration>,
+    pub client_addr: SocketAddr,
+    pub client_protocol_version: Option<i32>,
+    pub requested_server_address: Option<String>,
+    pub requested_server_port: Option<u16>,
+    pub player_name: Option<String>,
+    pub player_uuid: Option<u128>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum State {
+pub enum State {
     Handshaking,
     Status,
     Login,
@@ -599,7 +607,15 @@ async fn process_connection(conf: Arc<Configuration>, sock: TcpStream, client_ad
     if let Err(_) = sock.set_nodelay(true) {
         error!("failed to set nodelay");
     }
-    let mut conn = Connection { conf, client_addr };
+    let mut conn = Connection {
+        conf,
+        client_addr,
+        client_protocol_version: None,
+        requested_server_address: None,
+        requested_server_port: None,
+        player_name: None,
+        player_uuid: None,
+    };
     let mut stateful_chan = StatefulChannel::Handshaking {
         chan: HandshakingPacketCodec.framed(sock),
     };
@@ -607,9 +623,6 @@ async fn process_connection(conf: Arc<Configuration>, sock: TcpStream, client_ad
         match stateful_chan {
             StatefulChannel::Handshaking { mut chan } => {
                 match state_handshaking(&mut conn, &mut chan).await {
-                    Ok(State::Handshaking) => {
-                        error!("unexpected state transition: Handshaking -> Handshaking");
-                    }
                     Ok(State::Status) => {
                         info!("state transition: Handshaking -> Status");
                         stateful_chan = StatefulChannel::Status {
@@ -628,42 +641,27 @@ async fn process_connection(conf: Arc<Configuration>, sock: TcpStream, client_ad
                     Err(e) => {
                         error!("unexpected error: {}", e);
                     }
+                    _ => unreachable!(),
                 }
                 break;
             }
             StatefulChannel::Status { mut chan } => {
                 match state_status(&mut conn, &mut chan).await {
-                    Ok(State::Handshaking) => {
-                        error!("unexpected state transition: Status -> Handshaking");
-                    }
-                    Ok(State::Status) => {
-                        error!("unexpected state transition: Status -> Status");
-                    }
-                    Ok(State::Login) => {
-                        error!("unexpected state transition: Status -> Login");
-                    }
                     Ok(State::Disconnected) => {}
                     Err(e) => {
                         error!("unexpected error: {}", e);
                     }
+                    _ => unreachable!(),
                 }
                 break;
             }
             StatefulChannel::Login { mut chan } => {
                 match state_login(&mut conn, &mut chan).await {
-                    Ok(State::Handshaking) => {
-                        error!("unexpected state transition: Login -> Handshaking");
-                    }
-                    Ok(State::Status) => {
-                        error!("unexpected state transition: Login -> Status");
-                    }
-                    Ok(State::Login) => {
-                        error!("unexpected state transition: Login -> Login");
-                    }
                     Ok(State::Disconnected) => {}
                     Err(e) => {
                         error!("unexpected error: {}", e);
                     }
+                    _ => unreachable!(),
                 }
                 break;
             }
@@ -685,6 +683,9 @@ async fn state_handshaking(
                     match packet.body {
                         C2SHandshakingPacketBody::Handshake { protocol_version, server_address, server_port, next_state } => {
                             info!("client handshake");
+                            conn.client_protocol_version = Some(*protocol_version);
+                            conn.requested_server_address = Some(server_address.to_string());
+                            conn.requested_server_port = Some(server_port);
                             match next_state {
                                 HandshakeNextState::Status => {
                                     return Ok(State::Status);
@@ -722,20 +723,22 @@ async fn state_status(
                         match packet.body {
                             C2SStatusPacketBody::StatusRequest {} => {
                                 info!("status request");
-                                chan.send(S2CStatusPacket::StatusResponse { json_response: SizedString(r#"{"version":{"name":"Minecraft: Dummy Edition","protocol":765},"players":{"max":-2147483648,"online":-2147483648,"sample":[]},"description":{"text":"Minecraft: Dummy Edition"}}"#.to_string()) }).await?;
-                            },
+                                chan.send(S2CStatusPacket::StatusResponse {
+                                    json_response: SizedString(r#"{"version":{"name":"Minecraft: Dummy Edition","protocol":$1},"players":{"max":-2147483648,"online":-2147483648,"sample":[]},"description":{"text":"Minecraft: Dummy Edition"}}"#.to_string().replace("$1", conn.client_protocol_version.unwrap().to_string().as_str()))
+                                }).await?;
+                            }
                             C2SStatusPacketBody::PingRequest { payload } => {
                                 info!("ping request");
                                 chan.send(S2CStatusPacket::PingResponse { payload }).await?;
-                            },
+                            }
                         }
                     }
                     Some(Err(e)) => {
                         bail!("error reading c2s packet: {}", e);
-                    },
+                    }
                     None => {
                         return Ok(State::Disconnected);
-                    },
+                    }
                 }
             }
         }
@@ -756,6 +759,8 @@ async fn state_login(
                         match packet.body {
                             C2SLoginPacketBody::LoginStart { name, player_uuid } => {
                                 info!("login start");
+                                conn.player_name = Some(name.to_string());
+                                conn.player_uuid = Some(player_uuid);
                                 chan.send(S2CLoginPacket::Disconnect { reason: SizedString(r#"{"translate":"multiplayer.disconnect.incompatible","with":["Minecraft: Dummy Edition"]}"#.to_string()) }).await?;
                             },
                         }
