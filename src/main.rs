@@ -576,6 +576,7 @@ struct Connection {
 enum State {
     Handshaking,
     Status,
+    Login,
     Disconnected,
 }
 
@@ -586,6 +587,9 @@ enum StatefulChannel {
     },
     Status {
         chan: Framed<TcpStream, StatusPacketCodec>,
+    },
+    Login {
+        chan: Framed<TcpStream, LoginPacketCodec>,
     },
 }
 
@@ -613,6 +617,13 @@ async fn process_connection(conf: Arc<Configuration>, sock: TcpStream, client_ad
                         };
                         continue;
                     }
+                    Ok(State::Login) => {
+                        info!("state transition: Handshaking -> Login");
+                        stateful_chan = StatefulChannel::Login {
+                            chan: chan.map_codec(|_| LoginPacketCodec),
+                        };
+                        continue;
+                    }
                     Ok(State::Disconnected) => {}
                     Err(e) => {
                         error!("unexpected error: {}", e);
@@ -627,6 +638,27 @@ async fn process_connection(conf: Arc<Configuration>, sock: TcpStream, client_ad
                     }
                     Ok(State::Status) => {
                         error!("unexpected state transition: Status -> Status");
+                    }
+                    Ok(State::Login) => {
+                        error!("unexpected state transition: Status -> Login");
+                    }
+                    Ok(State::Disconnected) => {}
+                    Err(e) => {
+                        error!("unexpected error: {}", e);
+                    }
+                }
+                break;
+            }
+            StatefulChannel::Login { mut chan } => {
+                match state_login(&mut conn, &mut chan).await {
+                    Ok(State::Handshaking) => {
+                        error!("unexpected state transition: Login -> Handshaking");
+                    }
+                    Ok(State::Status) => {
+                        error!("unexpected state transition: Login -> Status");
+                    }
+                    Ok(State::Login) => {
+                        error!("unexpected state transition: Login -> Login");
                     }
                     Ok(State::Disconnected) => {}
                     Err(e) => {
@@ -659,7 +691,7 @@ async fn state_handshaking(
                                 },
                                 HandshakeNextState::Login => {
                                     info!("client attempts to login");
-                                    return Ok(State::Disconnected);
+                                    return Ok(State::Login);
                                 },
                             }
                         },
@@ -695,6 +727,36 @@ async fn state_status(
                             C2SStatusPacketBody::PingRequest { payload } => {
                                 info!("ping request");
                                 chan.send(S2CStatusPacket::PingResponse { payload }).await?;
+                            },
+                        }
+                    }
+                    Some(Err(e)) => {
+                        bail!("error reading c2s packet: {}", e);
+                    },
+                    None => {
+                        return Ok(State::Disconnected);
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[instrument(level = "info", name = "login", skip_all)]
+async fn state_login(
+    conn: &mut Connection,
+    chan: &mut Framed<TcpStream, LoginPacketCodec>,
+) -> Result<State> {
+    loop {
+        select! {
+            result = chan.next() => {
+                match result {
+                    Some(Ok(packet)) => {
+                        debug!("received c2s packet {:?}", packet.body);
+                        match packet.body {
+                            C2SLoginPacketBody::LoginStart { name, player_uuid } => {
+                                info!("login start");
+                                chan.send(S2CLoginPacket::Disconnect { reason: SizedString(r#"{"translate":"multiplayer.disconnect.incompatible","with":["Minecraft: Dummy Edition"]}"#.to_string()) }).await?;
                             },
                         }
                     }
