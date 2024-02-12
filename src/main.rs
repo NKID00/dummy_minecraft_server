@@ -492,14 +492,73 @@ async fn status_packet_codec() {
         .await
         .unwrap();
     let buffer = framed.into_inner();
+    let expected = b"aaa\x09\x01\x00\x00\x00\x00\x00\x00\x00\x00";
+    assert_eq!(buffer.position() as usize, expected.len());
+    assert_eq!(buffer.into_inner(), expected);
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[binwrite]
+#[brw(big)]
+enum S2CLoginPacket {
+    #[brw(magic(b"\x00"))]
+    Disconnect { reason: SizedString },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct C2SLoginPacket {
+    length: usize,
+    body: C2SLoginPacketBody,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[binread]
+#[brw(big)]
+enum C2SLoginPacketBody {
+    #[brw(magic(b"\x00"))]
+    LoginStart {
+        name: SizedString,
+        player_uuid: u128,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct LoginPacketCodec;
+impl_decoder!(LoginPacketCodec, C2SLoginPacket, C2SLoginPacketBody);
+impl_encoder!(LoginPacketCodec, S2CLoginPacket);
+
+#[tokio::test]
+async fn login_packet_codec() {
+    let buffer = Cursor::new(b"\x16\x00\x04\x6a\x65\x62\x5f\x85\x3c\x80\xef\x3c\x37\x49\xfd\xaa\x49\x93\x8b\x67\x4a\xda\xe6");
+    let mut framed = FramedRead::new(buffer, LoginPacketCodec);
     assert_eq!(
-        buffer.position() as usize,
-        b"aaa\x09\x01\x00\x00\x00\x00\x00\x00\x00\x00".len()
+        framed.next().await.unwrap().unwrap(),
+        C2SLoginPacket {
+            length: 22,
+            body: C2SLoginPacketBody::LoginStart {
+                name: SizedString("jeb_".to_string()),
+                player_uuid: 0x853c80ef3c3749fdaa49938b674adae6
+            }
+        }
     );
-    assert_eq!(
-        buffer.into_inner(),
-        b"aaa\x09\x01\x00\x00\x00\x00\x00\x00\x00\x00"
-    );
+    assert!(framed.next().await.is_none());
+
+    let mut buffer = Cursor::new(b"aaa".to_vec());
+    buffer.advance(buffer.remaining());
+    assert_eq!(buffer.position() as usize, b"aaa".len());
+    let mut framed = FramedWrite::new(buffer, LoginPacketCodec);
+    framed
+        .send(S2CLoginPacket::Disconnect {
+            reason: SizedString(
+                r#"{"translate":"multiplayer.disconnect.not_whitelisted"}"#.to_string(),
+            ),
+        })
+        .await
+        .unwrap();
+    let buffer = framed.into_inner();
+    let expected = b"aaa\x38\x00\x36\x7b\x22\x74\x72\x61\x6e\x73\x6c\x61\x74\x65\x22\x3a\x22\x6d\x75\x6c\x74\x69\x70\x6c\x61\x79\x65\x72\x2e\x64\x69\x73\x63\x6f\x6e\x6e\x65\x63\x74\x2e\x6e\x6f\x74\x5f\x77\x68\x69\x74\x65\x6c\x69\x73\x74\x65\x64\x22\x7d";
+    assert_eq!(buffer.position() as usize, expected.len());
+    assert_eq!(buffer.into_inner(), expected);
 }
 
 #[derive(Debug)]
