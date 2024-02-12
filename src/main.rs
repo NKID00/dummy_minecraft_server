@@ -3,7 +3,8 @@ use std::{
     io::{Cursor, Seek},
     net::SocketAddr,
     ops::{Deref, DerefMut},
-    sync::Arc, time::Duration,
+    sync::Arc,
+    time::Duration,
 };
 
 use binrw::{binread, binrw, binwrite, BinRead, BinReaderExt, BinResult, BinWrite, BinWriterExt};
@@ -15,21 +16,15 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    select, spawn, time::sleep,
+    select, spawn,
+    time::sleep,
 };
 use tokio_util::{
     bytes::{Buf, BytesMut},
-    codec::{Decoder, Encoder, FramedRead, FramedWrite},
+    codec::{Decoder, Encoder, Framed, FramedRead, FramedWrite},
 };
 use tracing::{debug, error, info, instrument, Instrument, Level, Subscriber};
 use tracing_subscriber::{fmt::format::FmtSpan, util::SubscriberInitExt};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum State {
-    Handshaking,
-    Status,
-    Disconnected,
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 #[binrw]
@@ -295,7 +290,6 @@ macro_rules! impl_decoder {
             type Error = Report;
 
             fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
-                debug!("decode: {:?}", src);
                 let mut reader = Cursor::new(&src[..]);
                 let length = match VarInt::read(&mut reader) {
                     Ok(v) => v,
@@ -341,8 +335,8 @@ macro_rules! impl_decoder {
                 if reader.has_remaining() {
                     bail!("packet length does not match: extra bytes");
                 }
-                debug!("src.advance: {}", length_length + length);
                 src.advance(length_length + length);
+                debug!("read packet: {}, {}, {:?}", length_length, length, result);
                 Ok(Some($item {
                     length,
                     body: result,
@@ -368,7 +362,20 @@ macro_rules! impl_encoder {
                 VarInt(length as i32).write(&mut length_writer)?;
                 dst.extend(length_writer.into_inner());
                 dst.extend(writer.into_inner());
+                debug!("wrote packet: {}, {:?}", length, item);
                 Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! impl_blank_encoder {
+    ($type:ident) => {
+        impl Encoder<()> for $type {
+            type Error = Report;
+
+            fn encode(&mut self, _item: (), _dst: &mut BytesMut) -> Result<()> {
+                unimplemented!("encoding is not supported");
             }
         }
     };
@@ -403,12 +410,14 @@ enum HandshakeNextState {
     Login,
 }
 
+#[derive(Debug, Clone)]
 struct HandshakingPacketCodec;
 impl_decoder!(
     HandshakingPacketCodec,
     C2SHandshakingPacket,
     C2SHandshakingPacketBody
 );
+impl_blank_encoder!(HandshakingPacketCodec);
 
 #[tokio::test]
 async fn handshaking_packet_codec() {
@@ -456,6 +465,7 @@ enum C2SStatusPacketBody {
     PingRequest { payload: i64 },
 }
 
+#[derive(Debug, Clone)]
 struct StatusPacketCodec;
 impl_decoder!(StatusPacketCodec, C2SStatusPacket, C2SStatusPacketBody);
 impl_encoder!(StatusPacketCodec, S2CStatusPacket);
@@ -500,62 +510,97 @@ struct Configuration {
 #[derive(Debug)]
 struct Connection {
     conf: Arc<Configuration>,
-    c2s: OwnedReadHalf,
-    s2c: OwnedWriteHalf,
     client_addr: SocketAddr,
-    state: State,
 }
 
-#[instrument(level = "debug", name = "conn", skip_all, fields(client = client_addr.to_string()))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Handshaking,
+    Status,
+    Disconnected,
+}
+
+#[derive(Debug)]
+enum StatefulChannel {
+    Handshaking {
+        chan: Framed<TcpStream, HandshakingPacketCodec>,
+    },
+    Status {
+        chan: Framed<TcpStream, StatusPacketCodec>,
+    },
+}
+
+#[instrument(level = "info", name = "", skip_all, fields(client = client_addr.to_string()))]
 async fn process_connection(conf: Arc<Configuration>, sock: TcpStream, client_addr: SocketAddr) {
+    info!("connected");
     if let Err(_) = sock.set_nodelay(true) {
         error!("failed to set nodelay");
     }
-    let (c2s, s2c) = sock.into_split();
-    let mut conn = Connection {
-        conf,
-        c2s,
-        s2c,
-        client_addr,
-        state: State::Handshaking,
+    let mut conn = Connection { conf, client_addr };
+    let mut stateful_chan = StatefulChannel::Handshaking {
+        chan: HandshakingPacketCodec.framed(sock),
     };
-    info!("connected from {}", client_addr);
     loop {
-        debug!("state: {:?}", conn.state);
-        conn = match match conn.state {
-            State::Handshaking => state_handshaking(conn).await,
-            State::Status => state_status(conn).await,
-            State::Disconnected => break,
-        } {
-            Ok(conn) => conn,
-            Err(e) => {
-                error!("unexpected error: {}", e);
+        match stateful_chan {
+            StatefulChannel::Handshaking { mut chan } => {
+                match state_handshaking(&mut conn, &mut chan).await {
+                    Ok(State::Handshaking) => {
+                        error!("unexpected state transition: Handshaking -> Handshaking");
+                    }
+                    Ok(State::Status) => {
+                        info!("state transition: Handshaking -> Status");
+                        stateful_chan = StatefulChannel::Status {
+                            chan: chan.map_codec(|_| StatusPacketCodec),
+                        };
+                        continue;
+                    }
+                    Ok(State::Disconnected) => {}
+                    Err(e) => {
+                        error!("unexpected error: {}", e);
+                    }
+                }
+                break;
+            }
+            StatefulChannel::Status { mut chan } => {
+                match state_status(&mut conn, &mut chan).await {
+                    Ok(State::Handshaking) => {
+                        error!("unexpected state transition: Status -> Handshaking");
+                    }
+                    Ok(State::Status) => {
+                        error!("unexpected state transition: Status -> Status");
+                    }
+                    Ok(State::Disconnected) => {}
+                    Err(e) => {
+                        error!("unexpected error: {}", e);
+                    }
+                }
                 break;
             }
         }
     }
-    info!("disconnected with {}", client_addr);
+    info!("disconnected");
 }
 
 #[instrument(level = "info", name = "handshaking", skip_all)]
-async fn state_handshaking(conn: Connection) -> Result<Connection> {
-    let state;
-    let mut c2s_framed = FramedRead::new(conn.c2s, HandshakingPacketCodec);
+async fn state_handshaking(
+    conn: &mut Connection,
+    chan: &mut Framed<TcpStream, HandshakingPacketCodec>,
+) -> Result<State> {
     select! {
-        result = c2s_framed.next() => {
+        result = chan.next() => {
             match result {
                 Some(Ok(packet)) => {
                     debug!("received c2s packet {:?}", packet.body);
                     match packet.body {
                         C2SHandshakingPacketBody::Handshake { protocol_version, server_address, server_port, next_state } => {
+                            info!("client handshake");
                             match next_state {
                                 HandshakeNextState::Status => {
-                                    info!("client ping");
-                                    state = State::Status;
+                                    return Ok(State::Status);
                                 },
                                 HandshakeNextState::Login => {
                                     info!("client attempts to login");
-                                    state = State::Disconnected;
+                                    return Ok(State::Disconnected);
                                 },
                             }
                         },
@@ -565,61 +610,45 @@ async fn state_handshaking(conn: Connection) -> Result<Connection> {
                     bail!("error reading c2s packet: {}", e);
                 },
                 None => {
-                    state = State::Disconnected;
+                    return Ok(State::Disconnected);
                 },
             }
         }
     }
-    sleep(Duration::from_millis(100)).await;
-    // FIXME: remaining data is not preserved while calling .into_inner()
-    let inner = c2s_framed.into_inner();
-    info!("inner.readable() = {:?}", inner.readable().now_or_never());
-    Ok(Connection {
-        c2s: inner,
-        state,
-        ..conn
-    })
 }
 
 #[instrument(level = "info", name = "status", skip_all)]
-async fn state_status(conn: Connection) -> Result<Connection> {
-    let state;
-    let mut c2s_framed = FramedRead::new(conn.c2s, StatusPacketCodec);
-    let mut s2c_framed = FramedWrite::new(conn.s2c, StatusPacketCodec);
+async fn state_status(
+    conn: &mut Connection,
+    chan: &mut Framed<TcpStream, StatusPacketCodec>,
+) -> Result<State> {
     loop {
         select! {
-            result = c2s_framed.next() => {
+            result = chan.next() => {
                 match result {
                     Some(Ok(packet)) => {
                         debug!("received c2s packet {:?}", packet.body);
                         match packet.body {
                             C2SStatusPacketBody::StatusRequest {} => {
-                                s2c_framed.send(S2CStatusPacket::StatusResponse { json_response: SizedString(r#"{"version":{"name":"Minecraft: Dummy Edition","protocol":765},"players":{"max":-2147483648,"online":-2147483648,"sample":[]},"description":{"text":"Minecraft: Dummy Edition"},"enforcesSecureChat":false,"previewsChat":true}"#.to_string()) }).await?;
+                                info!("status request");
+                                chan.send(S2CStatusPacket::StatusResponse { json_response: SizedString(r#"{"version":{"name":"Minecraft: Dummy Edition","protocol":765},"players":{"max":-2147483648,"online":-2147483648,"sample":[]},"description":{"text":"Minecraft: Dummy Edition"}}"#.to_string()) }).await?;
                             },
                             C2SStatusPacketBody::PingRequest { payload } => {
-                                s2c_framed.send(S2CStatusPacket::PingResponse { payload }).await?;
+                                info!("ping request");
+                                chan.send(S2CStatusPacket::PingResponse { payload }).await?;
                             },
                         }
                     }
                     Some(Err(e)) => {
-                        error!("error reading c2s packet: {}", e);
-                        state = State::Disconnected;
-                        break;
+                        bail!("error reading c2s packet: {}", e);
                     },
                     None => {
-                        state = State::Disconnected;
-                        break;
+                        return Ok(State::Disconnected);
                     },
                 }
             }
         }
     }
-    Ok(Connection {
-        c2s: c2s_framed.into_inner(),
-        s2c: s2c_framed.into_inner(),
-        state,
-        ..conn
-    })
 }
 
 #[tokio::main]
