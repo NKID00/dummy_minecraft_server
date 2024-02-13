@@ -10,6 +10,8 @@ use binrw::{binread, binrw, binwrite, BinRead, BinReaderExt, BinResult, BinWrite
 use byteorder::WriteBytesExt;
 use eyre::{bail, Report, Result};
 use futures::{SinkExt, StreamExt};
+use paste::paste;
+use serde_json::json;
 use tokio::{
     net::{TcpListener, TcpStream},
     select, spawn,
@@ -81,6 +83,55 @@ fn var_int_writer(value: &i32) -> BinResult<()> {
     }
     Ok(())
 }
+
+macro_rules! impl_var_int {
+    ($type:ident) => {
+        paste! {
+            #[binrw::parser(reader)]
+            pub fn [<var_int_ $type _parser>]() -> BinResult<$type> {
+                let mut buffer = [0u8];
+                let mut value = 0i32;
+                let mut position = 0u8;
+                loop {
+                    reader.read_exact(&mut buffer)?;
+                    value |= ((buffer[0] & 0b0111_1111) as i32) << position;
+                    if buffer[0] & 0b1000_0000 == 0 {
+                        break;
+                    }
+                    position += 7;
+                    if position >= 32 {
+                        return BinResult::Err(binrw::Error::AssertFail {
+                            pos: 5,
+                            message: "VarInt too long".to_string(),
+                        });
+                    }
+                }
+                Ok(value as $type)
+            }
+
+            #[binrw::writer(writer)]
+            pub fn [<var_int_ $type _writer>](value: &$type) -> BinResult<()> {
+                let mut value = *value as i32;
+                loop {
+                    if value & (!0b0111_1111i32) == 0 {
+                        writer.write_u8(value as u8)?;
+                        break;
+                    }
+                    writer.write_u8((value as u8 & 0b0111_1111) | 0b1000_0000)?;
+                    value = ((value as u32) >> 7) as i32;
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
+impl_var_int!(i8);
+impl_var_int!(u8);
+impl_var_int!(i16);
+impl_var_int!(u16);
+impl_var_int!(i32);
+impl_var_int!(u32);
 
 #[test]
 fn var_int() {
@@ -169,6 +220,57 @@ fn var_long_writer(value: &i64) -> BinResult<()> {
     }
     Ok(())
 }
+
+macro_rules! impl_var_long {
+    ($type:ident) => {
+        paste! {
+            #[binrw::parser(reader)]
+            pub fn [<var_long_ $type _parser>]() -> BinResult<i64> {
+                let mut buffer = [0u8];
+                let mut value = 0i64;
+                let mut position = 0u8;
+                loop {
+                    reader.read_exact(&mut buffer)?;
+                    value |= ((buffer[0] & 0b0111_1111) as i64) << position;
+                    if buffer[0] & 0b1000_0000 == 0 {
+                        break;
+                    }
+                    position += 7;
+                    if position >= 64 {
+                        return BinResult::Err(binrw::Error::AssertFail {
+                            pos: 10,
+                            message: "VarLong too long".to_string(),
+                        });
+                    }
+                }
+                Ok(value)
+            }
+
+            #[binrw::writer(writer)]
+            pub fn [<var_long_ $type _writer>](value: &i64) -> BinResult<()> {
+                let mut value = *value;
+                loop {
+                    if value & (!0b0111_1111i64) == 0 {
+                        writer.write_u8(value as u8)?;
+                        break;
+                    }
+                    writer.write_u8((value as u8 & 0b0111_1111) | 0b1000_0000)?;
+                    value = ((value as u64) >> 7) as i64;
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
+impl_var_long!(i8);
+impl_var_long!(u8);
+impl_var_long!(i16);
+impl_var_long!(u16);
+impl_var_long!(i32);
+impl_var_long!(u32);
+impl_var_long!(i64);
+impl_var_long!(u64);
 
 #[test]
 fn var_long() {
@@ -396,8 +498,12 @@ struct C2SHandshakingPacket {
 enum C2SHandshakingPacketBody {
     #[brw(magic(b"\x00"))]
     Handshake {
-        protocol_version: VarInt,
-        server_address: SizedString,
+        #[br(parse_with(var_int_i32_parser))]
+        #[bw(write_with(var_int_i32_writer))]
+        protocol_version: i32,
+        #[br(parse_with(sized_string_parser))]
+        #[bw(write_with(sized_string_writer))]
+        server_address: String,
         server_port: u16,
         next_state: HandshakeNextState,
     },
@@ -432,8 +538,8 @@ async fn handshaking_packet_codec() {
         C2SHandshakingPacket {
             length: 16,
             body: C2SHandshakingPacketBody::Handshake {
-                protocol_version: VarInt(765),
-                server_address: SizedString("localhost".to_string()),
+                protocol_version: 765,
+                server_address: "localhost".to_string(),
                 server_port: 25565,
                 next_state: HandshakeNextState::Status,
             }
@@ -447,7 +553,11 @@ async fn handshaking_packet_codec() {
 #[brw(big)]
 enum S2CStatusPacket {
     #[brw(magic(b"\x00"))]
-    StatusResponse { json_response: SizedString },
+    StatusResponse {
+        #[br(parse_with(sized_string_parser))]
+        #[bw(write_with(sized_string_writer))]
+        json_response: String,
+    },
     #[brw(magic(b"\x01"))]
     PingResponse { payload: i64 },
 }
@@ -505,7 +615,11 @@ async fn status_packet_codec() {
 #[brw(big)]
 enum S2CLoginPacket {
     #[brw(magic(b"\x00"))]
-    Disconnect { reason: SizedString },
+    Disconnect {
+        #[br(parse_with(sized_string_parser))]
+        #[bw(write_with(sized_string_writer))]
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -520,7 +634,9 @@ struct C2SLoginPacket {
 enum C2SLoginPacketBody {
     #[brw(magic(b"\x00"))]
     LoginStart {
-        name: SizedString,
+        #[br(parse_with(sized_string_parser))]
+        #[bw(write_with(sized_string_writer))]
+        name: String,
         player_uuid: u128,
     },
 }
@@ -539,7 +655,7 @@ async fn login_packet_codec() {
         C2SLoginPacket {
             length: 22,
             body: C2SLoginPacketBody::LoginStart {
-                name: SizedString("jeb_".to_string()),
+                name: "jeb_".to_string(),
                 player_uuid: 0x853c80ef3c3749fdaa49938b674adae6
             }
         }
@@ -552,9 +668,7 @@ async fn login_packet_codec() {
     let mut framed = FramedWrite::new(buffer, LoginPacketCodec);
     framed
         .send(S2CLoginPacket::Disconnect {
-            reason: SizedString(
-                r#"{"translate":"multiplayer.disconnect.not_whitelisted"}"#.to_string(),
-            ),
+            reason: r#"{"translate":"multiplayer.disconnect.not_whitelisted"}"#.to_string(),
         })
         .await
         .unwrap();
@@ -683,7 +797,7 @@ async fn state_handshaking(
                     match packet.body {
                         C2SHandshakingPacketBody::Handshake { protocol_version, server_address, server_port, next_state } => {
                             info!("client handshake");
-                            conn.client_protocol_version = Some(*protocol_version);
+                            conn.client_protocol_version = Some(protocol_version);
                             conn.requested_server_address = Some(server_address.to_string());
                             conn.requested_server_port = Some(server_port);
                             match next_state {
@@ -724,7 +838,19 @@ async fn state_status(
                             C2SStatusPacketBody::StatusRequest {} => {
                                 info!("status request");
                                 chan.send(S2CStatusPacket::StatusResponse {
-                                    json_response: SizedString(r#"{"version":{"name":"Minecraft: Dummy Edition","protocol":$1},"players":{"max":-2147483648,"online":-2147483648,"sample":[]},"description":{"text":"Minecraft: Dummy Edition"}}"#.to_string().replace("$1", conn.client_protocol_version.unwrap().to_string().as_str()))
+                                    json_response: json!({
+                                        "version": {
+                                            "name":"Minecraft: Dummy Edition",
+                                            "protocol": conn.client_protocol_version
+                                        },
+                                        "players": {
+                                            "max": -2147483648,
+                                            "online":-2147483648,
+                                        },
+                                        "description": {
+                                            "text": "Minecraft: Dummy Edition"
+                                        }
+                                    }).to_string()
                                 }).await?;
                             }
                             C2SStatusPacketBody::PingRequest { payload } => {
@@ -761,7 +887,14 @@ async fn state_login(
                                 info!("login start");
                                 conn.player_name = Some(name.to_string());
                                 conn.player_uuid = Some(player_uuid);
-                                chan.send(S2CLoginPacket::Disconnect { reason: SizedString(r#"{"translate":"multiplayer.disconnect.incompatible","with":["Minecraft: Dummy Edition"]}"#.to_string()) }).await?;
+                                chan.send(S2CLoginPacket::Disconnect { 
+                                    reason: json!({
+                                        "translate": "multiplayer.disconnect.incompatible",
+                                        "with": [
+                                            "Minecraft: Dummy Edition"
+                                        ]
+                                    }).to_string()
+                                }).await?;
                             },
                         }
                     }
