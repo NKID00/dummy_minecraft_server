@@ -913,7 +913,7 @@ async fn state_login(
 #[tokio::main]
 async fn main() -> Result<()> {
     let conf = Configuration {
-        addr: "127.0.0.1:25565".to_string(),
+        addr: "0.0.0.0:25565".to_string(),
     };
     let conf = Arc::new(conf);
     if cfg!(debug_assertions) {
