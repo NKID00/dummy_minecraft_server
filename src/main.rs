@@ -887,7 +887,7 @@ async fn state_login(
                                 info!("login start");
                                 conn.player_name = Some(name.to_string());
                                 conn.player_uuid = Some(player_uuid);
-                                chan.send(S2CLoginPacket::Disconnect { 
+                                chan.send(S2CLoginPacket::Disconnect {
                                     reason: json!({
                                         "translate": "multiplayer.disconnect.incompatible",
                                         "with": [
