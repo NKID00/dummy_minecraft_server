@@ -28,13 +28,15 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
       - name: Build
         run: |
-          cargo build -r
-          strip target/release/dummy_minecraft_server
+          cargo build -r --target x86_64-unknown-linux-musl
+          strip target/x86_64-unknown-linux-musl/release/dummy_minecraft_server
       - uses: actions/upload-artifact@v3
         with:
-          path: target/release/dummy_minecraft_server
+          path: target/x86_64-unknown-linux-musl/release/dummy_minecraft_server
   package:
     needs: build
     runs-on: ubuntu-latest
