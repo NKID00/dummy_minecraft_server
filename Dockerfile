@@ -1,3 +1,3 @@
-FROM gcr.io/distroless/base-nossl:latest
+FROM debian:12-slim
 COPY dummy_minecraft_server /
 ENTRYPOINT ["/dummy_minecraft_server"]
