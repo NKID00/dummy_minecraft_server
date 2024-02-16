@@ -7,7 +7,7 @@ use std::{
 };
 
 use binrw::{binread, binrw, binwrite, BinRead, BinReaderExt, BinResult, BinWrite, BinWriterExt};
-use byteorder::WriteBytesExt;
+use byteorder::{ReadBytesExt, WriteBytesExt};
 use eyre::{bail, Report, Result};
 use futures::{SinkExt, StreamExt};
 use paste::paste;
@@ -132,6 +132,8 @@ impl_var_int!(i16);
 impl_var_int!(u16);
 impl_var_int!(i32);
 impl_var_int!(u32);
+impl_var_int!(isize);
+impl_var_int!(usize);
 
 #[test]
 fn var_int() {
@@ -271,6 +273,8 @@ impl_var_long!(i32);
 impl_var_long!(u32);
 impl_var_long!(i64);
 impl_var_long!(u64);
+impl_var_long!(isize);
+impl_var_long!(usize);
 
 #[test]
 fn var_long() {
@@ -388,10 +392,75 @@ fn sized_string() {
     );
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[binrw]
+#[brw(big)]
+struct Boolean(
+    #[br(parse_with(boolean_parser))]
+    #[bw(write_with(boolean_writer))]
+    bool,
+);
+
+impl Deref for Boolean {
+    type Target = bool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Boolean {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Display for Boolean {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", **self)
+    }
+}
+
+#[binrw::parser(reader)]
+fn boolean_parser() -> BinResult<bool> {
+    match reader.read_u8()? {
+        0x01 => Ok(true),
+        0x00 => Ok(false),
+        _ => Err(binrw::Error::AssertFail {
+            pos: 0,
+            message: "Invalid Boolean".to_string(),
+        }),
+    }
+}
+
+#[binrw::writer(writer)]
+fn boolean_writer(value: &bool) -> BinResult<()> {
+    writer.write_u8(match value {
+        true => 0x01,
+        false => 0x00,
+    })?;
+    Ok(())
+}
+
+#[test]
+fn boolean() {
+    let mut buffer = Cursor::new(vec![]);
+    Boolean(true).write(&mut buffer).unwrap();
+    assert_eq!(buffer.get_ref(), b"\x01");
+    buffer.set_position(0);
+    assert_eq!(Boolean::read(&mut buffer).unwrap(), Boolean(true));
+
+    let mut buffer = Cursor::new(vec![]);
+    Boolean(false).write(&mut buffer).unwrap();
+    assert_eq!(buffer.get_ref(), b"\x00");
+    buffer.set_position(0);
+    assert_eq!(Boolean::read(&mut buffer).unwrap(), Boolean(false));
+}
+
 macro_rules! impl_decoder {
-    ($type:ident, $item:ident, $body:ident) => {
+    ($type:ident, $body:ident) => {
         impl Decoder for $type {
-            type Item = $item;
+            type Item = (usize, $body);
             type Error = Report;
 
             fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
@@ -442,10 +511,20 @@ macro_rules! impl_decoder {
                 }
                 src.advance(length_length + length);
                 debug!("read packet: {}, {}, {:?}", length_length, length, result);
-                Ok(Some($item {
-                    length,
-                    body: result,
-                }))
+                Ok(Some((length, result)))
+            }
+        }
+    };
+}
+
+macro_rules! impl_blank_decoder {
+    ($type:ident) => {
+        impl Decoder for $type {
+            type Item = ();
+            type Error = Report;
+
+            fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
+                unimplemented!("decoding is not supported");
             }
         }
     };
@@ -487,15 +566,9 @@ macro_rules! impl_blank_encoder {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct C2SHandshakingPacket {
-    length: usize,
-    body: C2SHandshakingPacketBody,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 #[binread]
 #[brw(big)]
-enum C2SHandshakingPacketBody {
+enum C2SHandshakingPacket {
     #[brw(magic(b"\x00"))]
     Handshake {
         #[br(parse_with(var_int_i32_parser))]
@@ -521,11 +594,7 @@ enum HandshakeNextState {
 
 #[derive(Debug, Clone)]
 struct HandshakingPacketCodec;
-impl_decoder!(
-    HandshakingPacketCodec,
-    C2SHandshakingPacket,
-    C2SHandshakingPacketBody
-);
+impl_decoder!(HandshakingPacketCodec, C2SHandshakingPacket);
 impl_blank_encoder!(HandshakingPacketCodec);
 
 #[tokio::test]
@@ -535,15 +604,15 @@ async fn handshaking_packet_codec() {
     let mut framed = FramedRead::new(buffer, HandshakingPacketCodec);
     assert_eq!(
         framed.next().await.unwrap().unwrap(),
-        C2SHandshakingPacket {
-            length: 16,
-            body: C2SHandshakingPacketBody::Handshake {
+        (
+            16,
+            C2SHandshakingPacket::Handshake {
                 protocol_version: 765,
                 server_address: "localhost".to_string(),
                 server_port: 25565,
                 next_state: HandshakeNextState::Status,
             }
-        }
+        )
     );
     assert!(framed.next().await.is_none());
 }
@@ -563,15 +632,9 @@ enum S2CStatusPacket {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct C2SStatusPacket {
-    length: usize,
-    body: C2SStatusPacketBody,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 #[binread]
 #[brw(big)]
-enum C2SStatusPacketBody {
+enum C2SStatusPacket {
     #[brw(magic(b"\x00"))]
     StatusRequest {},
     #[brw(magic(b"\x01"))]
@@ -580,7 +643,7 @@ enum C2SStatusPacketBody {
 
 #[derive(Debug, Clone)]
 struct StatusPacketCodec;
-impl_decoder!(StatusPacketCodec, C2SStatusPacket, C2SStatusPacketBody);
+impl_decoder!(StatusPacketCodec, C2SStatusPacket);
 impl_encoder!(StatusPacketCodec, S2CStatusPacket);
 
 #[tokio::test]
@@ -589,10 +652,7 @@ async fn status_packet_codec() {
     let mut framed = FramedRead::new(buffer, StatusPacketCodec);
     assert_eq!(
         framed.next().await.unwrap().unwrap(),
-        C2SStatusPacket {
-            length: 1,
-            body: C2SStatusPacketBody::StatusRequest {}
-        }
+        (1, C2SStatusPacket::StatusRequest {})
     );
     assert!(framed.next().await.is_none());
 
@@ -622,16 +682,11 @@ enum S2CLoginPacket {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct C2SLoginPacket {
-    length: usize,
-    body: C2SLoginPacketBody,
-}
-
+/// mc 1.20.2 -
 #[derive(Debug, Clone, PartialEq)]
 #[binread]
 #[brw(big)]
-enum C2SLoginPacketBody {
+enum C2SLoginPacket764 {
     #[brw(magic(b"\x00"))]
     LoginStart {
         #[br(parse_with(sized_string_parser))]
@@ -642,30 +697,150 @@ enum C2SLoginPacketBody {
 }
 
 #[derive(Debug, Clone)]
-struct LoginPacketCodec;
-impl_decoder!(LoginPacketCodec, C2SLoginPacket, C2SLoginPacketBody);
-impl_encoder!(LoginPacketCodec, S2CLoginPacket);
+struct LoginPacketCodec764;
+impl_decoder!(LoginPacketCodec764, C2SLoginPacket764);
+impl_encoder!(LoginPacketCodec764, S2CLoginPacket);
+
+/// mc 1.19.3 - 1.20.1
+#[derive(Debug, Clone, PartialEq)]
+#[binread]
+#[brw(big)]
+enum C2SLoginPacket761 {
+    #[brw(magic(b"\x00"))]
+    LoginStart {
+        #[br(parse_with(sized_string_parser))]
+        #[bw(write_with(sized_string_writer))]
+        name: String,
+        #[br(parse_with(boolean_parser))]
+        #[bw(write_with(boolean_writer))]
+        has_player_uuid: bool,
+        #[brw(if(has_player_uuid))]
+        player_uuid: u128,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct LoginPacketCodec761;
+impl_decoder!(LoginPacketCodec761, C2SLoginPacket761);
+impl_encoder!(LoginPacketCodec761, S2CLoginPacket);
+
+/// mc 1.19.1 - 1.19.2
+#[derive(Debug, Clone, PartialEq)]
+#[binread]
+#[brw(big)]
+enum C2SLoginPacket760 {
+    #[brw(magic(b"\x00"))]
+    LoginStart {
+        #[br(parse_with(sized_string_parser))]
+        #[bw(write_with(sized_string_writer))]
+        name: String,
+        #[br(parse_with(boolean_parser))]
+        #[bw(write_with(boolean_writer))]
+        has_sig_data: bool,
+        #[brw(if(has_sig_data))]
+        timestamp: u64,
+        #[brw(if(has_sig_data))]
+        #[br(parse_with(var_int_i32_parser))]
+        #[bw(write_with(var_int_i32_writer))]
+        public_key_length: i32,
+        #[brw(if(has_sig_data))]
+        #[br(count(public_key_length))]
+        public_key: Vec<u8>,
+        #[brw(if(has_sig_data))]
+        #[br(parse_with(var_int_i32_parser))]
+        #[bw(write_with(var_int_i32_writer))]
+        signature_length: i32,
+        #[brw(if(has_sig_data))]
+        #[br(count(signature_length))]
+        signature: Vec<u8>,
+        #[br(parse_with(boolean_parser))]
+        #[bw(write_with(boolean_writer))]
+        has_player_uuid: bool,
+        #[brw(if(has_player_uuid))]
+        player_uuid: u128,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct LoginPacketCodec760;
+impl_decoder!(LoginPacketCodec760, C2SLoginPacket760);
+impl_encoder!(LoginPacketCodec760, S2CLoginPacket);
+
+/// mc 1.19
+#[derive(Debug, Clone, PartialEq)]
+#[binread]
+#[brw(big)]
+enum C2SLoginPacket759 {
+    #[brw(magic(b"\x00"))]
+    LoginStart {
+        #[br(parse_with(sized_string_parser))]
+        #[bw(write_with(sized_string_writer))]
+        name: String,
+        #[br(parse_with(boolean_parser))]
+        #[bw(write_with(boolean_writer))]
+        has_sig_data: bool,
+        #[brw(if(has_sig_data))]
+        timestamp: u64,
+        #[brw(if(has_sig_data))]
+        #[br(parse_with(var_int_i32_parser))]
+        #[bw(write_with(var_int_i32_writer))]
+        public_key_length: i32,
+        #[brw(if(has_sig_data))]
+        #[br(count(public_key_length))]
+        public_key: Vec<u8>,
+        #[brw(if(has_sig_data))]
+        #[br(parse_with(var_int_i32_parser))]
+        #[bw(write_with(var_int_i32_writer))]
+        signature_length: i32,
+        #[brw(if(has_sig_data))]
+        #[br(count(signature_length))]
+        signature: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct LoginPacketCodec759;
+impl_decoder!(LoginPacketCodec759, C2SLoginPacket759);
+impl_encoder!(LoginPacketCodec759, S2CLoginPacket);
+
+/// mc 1.7 - 1.18.2
+#[derive(Debug, Clone, PartialEq)]
+#[binread]
+#[brw(big)]
+enum C2SLoginPacket0 {
+    #[brw(magic(b"\x00"))]
+    LoginStart {
+        #[br(parse_with(sized_string_parser))]
+        #[bw(write_with(sized_string_writer))]
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct LoginPacketCodec0;
+impl_decoder!(LoginPacketCodec0, C2SLoginPacket0);
+impl_encoder!(LoginPacketCodec0, S2CLoginPacket);
 
 #[tokio::test]
 async fn login_packet_codec() {
     let buffer = Cursor::new(b"\x16\x00\x04\x6a\x65\x62\x5f\x85\x3c\x80\xef\x3c\x37\x49\xfd\xaa\x49\x93\x8b\x67\x4a\xda\xe6");
-    let mut framed = FramedRead::new(buffer, LoginPacketCodec);
+    let mut framed = FramedRead::new(buffer, LoginPacketCodec764);
     assert_eq!(
         framed.next().await.unwrap().unwrap(),
-        C2SLoginPacket {
-            length: 22,
-            body: C2SLoginPacketBody::LoginStart {
+        (
+            22,
+            C2SLoginPacket764::LoginStart {
                 name: "jeb_".to_string(),
                 player_uuid: 0x853c80ef3c3749fdaa49938b674adae6
             }
-        }
+        )
     );
     assert!(framed.next().await.is_none());
 
     let mut buffer = Cursor::new(b"aaa".to_vec());
     buffer.advance(buffer.remaining());
     assert_eq!(buffer.position() as usize, b"aaa".len());
-    let mut framed = FramedWrite::new(buffer, LoginPacketCodec);
+    let mut framed = FramedWrite::new(buffer, LoginPacketCodec764);
     framed
         .send(S2CLoginPacket::Disconnect {
             reason: r#"{"translate":"multiplayer.disconnect.not_whitelisted"}"#.to_string(),
@@ -677,6 +852,11 @@ async fn login_packet_codec() {
     assert_eq!(buffer.position() as usize, expected.len());
     assert_eq!(buffer.into_inner(), expected);
 }
+
+#[derive(Debug, Clone)]
+struct BlankCodec;
+impl_blank_decoder!(BlankCodec);
+impl_blank_encoder!(BlankCodec);
 
 #[derive(Debug)]
 pub struct Configuration {
@@ -698,21 +878,12 @@ pub struct Connection {
 pub enum State {
     Handshaking,
     Status,
-    Login,
+    Login764,
+    Login761,
+    Login760,
+    Login759,
+    Login0,
     Disconnected,
-}
-
-#[derive(Debug)]
-enum StatefulChannel {
-    Handshaking {
-        chan: Framed<TcpStream, HandshakingPacketCodec>,
-    },
-    Status {
-        chan: Framed<TcpStream, StatusPacketCodec>,
-    },
-    Login {
-        chan: Framed<TcpStream, LoginPacketCodec>,
-    },
 }
 
 #[instrument(level = "info", name = "", skip_all, fields(client = client_addr.to_string()))]
@@ -730,56 +901,99 @@ async fn process_connection(conf: Arc<Configuration>, sock: TcpStream, client_ad
         player_name: None,
         player_uuid: None,
     };
-    let mut stateful_chan = StatefulChannel::Handshaking {
-        chan: HandshakingPacketCodec.framed(sock),
-    };
+    let mut state = State::Handshaking;
+    let mut chan = BlankCodec.framed(sock);
     loop {
-        match stateful_chan {
-            StatefulChannel::Handshaking { mut chan } => {
-                match state_handshaking(&mut conn, &mut chan).await {
-                    Ok(State::Status) => {
-                        info!("state transition: Handshaking -> Status");
-                        stateful_chan = StatefulChannel::Status {
-                            chan: chan.map_codec(|_| StatusPacketCodec),
-                        };
-                        continue;
-                    }
-                    Ok(State::Login) => {
-                        info!("state transition: Handshaking -> Login");
-                        stateful_chan = StatefulChannel::Login {
-                            chan: chan.map_codec(|_| LoginPacketCodec),
-                        };
-                        continue;
-                    }
-                    Ok(State::Disconnected) => {}
+        let next_state = match state {
+            State::Handshaking => {
+                let mut chan_mapped = chan.map_codec(|_| HandshakingPacketCodec);
+                let next_state = match state_handshaking(&mut conn, &mut chan_mapped).await {
+                    Ok(state) => state,
+
                     Err(e) => {
                         error!("unexpected error: {}", e);
+                        break;
                     }
-                    _ => unreachable!(),
-                }
-                break;
+                };
+                chan = chan_mapped.map_codec(|_| BlankCodec);
+                next_state
             }
-            StatefulChannel::Status { mut chan } => {
-                match state_status(&mut conn, &mut chan).await {
-                    Ok(State::Disconnected) => {}
+            State::Status => {
+                let mut chan_mapped = chan.map_codec(|_| StatusPacketCodec);
+                let next_state = match state_status(&mut conn, &mut chan_mapped).await {
+                    Ok(state) => state,
                     Err(e) => {
                         error!("unexpected error: {}", e);
+                        break;
                     }
-                    _ => unreachable!(),
-                }
-                break;
+                };
+                chan = chan_mapped.map_codec(|_| BlankCodec);
+                next_state
             }
-            StatefulChannel::Login { mut chan } => {
-                match state_login(&mut conn, &mut chan).await {
-                    Ok(State::Disconnected) => {}
+            State::Login764 => {
+                let mut chan_mapped = chan.map_codec(|_| LoginPacketCodec764);
+                let next_state = match state_login764(&mut conn, &mut chan_mapped).await {
+                    Ok(state) => state,
                     Err(e) => {
                         error!("unexpected error: {}", e);
+                        break;
                     }
-                    _ => unreachable!(),
-                }
-                break;
+                };
+                chan = chan_mapped.map_codec(|_| BlankCodec);
+                next_state
             }
-        }
+            State::Login761 => {
+                let mut chan_mapped = chan.map_codec(|_| LoginPacketCodec761);
+                let next_state = match state_login761(&mut conn, &mut chan_mapped).await {
+                    Ok(state) => state,
+                    Err(e) => {
+                        error!("unexpected error: {}", e);
+                        break;
+                    }
+                };
+                chan = chan_mapped.map_codec(|_| BlankCodec);
+                next_state
+            }
+            State::Login760 => {
+                let mut chan_mapped = chan.map_codec(|_| LoginPacketCodec760);
+                let next_state = match state_login760(&mut conn, &mut chan_mapped).await {
+                    Ok(state) => state,
+                    Err(e) => {
+                        error!("unexpected error: {}", e);
+                        break;
+                    }
+                };
+                chan = chan_mapped.map_codec(|_| BlankCodec);
+                next_state
+            }
+            State::Login759 => {
+                let mut chan_mapped = chan.map_codec(|_| LoginPacketCodec759);
+                let next_state = match state_login759(&mut conn, &mut chan_mapped).await {
+                    Ok(state) => state,
+                    Err(e) => {
+                        error!("unexpected error: {}", e);
+                        break;
+                    }
+                };
+                chan = chan_mapped.map_codec(|_| BlankCodec);
+                next_state
+            }
+            State::Login0 => {
+                let mut chan_mapped = chan.map_codec(|_| LoginPacketCodec0);
+                let next_state = match state_login0(&mut conn, &mut chan_mapped).await {
+                    Ok(state) => state,
+                    Err(e) => {
+                        error!("unexpected error: {}", e);
+                        break;
+                    }
+                };
+                chan = chan_mapped.map_codec(|_| BlankCodec);
+                next_state
+            }
+            State::Disconnected => break,
+        };
+        debug!("state transition: {:?} -> {:?}", state, next_state);
+        state = next_state;
     }
     info!("disconnected");
 }
@@ -792,10 +1006,10 @@ async fn state_handshaking(
     select! {
         result = chan.next() => {
             match result {
-                Some(Ok(packet)) => {
-                    debug!("received c2s packet {:?}", packet.body);
-                    match packet.body {
-                        C2SHandshakingPacketBody::Handshake { protocol_version, server_address, server_port, next_state } => {
+                Some(Ok((length, packet))) => {
+                    debug!("received c2s packet {:?}", packet);
+                    match packet {
+                        C2SHandshakingPacket::Handshake { protocol_version, server_address, server_port, next_state } => {
                             info!("client handshake");
                             conn.client_protocol_version = Some(protocol_version);
                             conn.requested_server_address = Some(server_address.to_string());
@@ -806,7 +1020,13 @@ async fn state_handshaking(
                                 },
                                 HandshakeNextState::Login => {
                                     info!("client attempts to login");
-                                    return Ok(State::Login);
+                                    return Ok(match protocol_version {
+                                        764.. => State::Login764,
+                                        761..=763 => State::Login761,
+                                        760 => State::Login760,
+                                        759 => State::Login759,
+                                        _ => State::Login0,
+                                    });
                                 },
                             }
                         },
@@ -832,10 +1052,10 @@ async fn state_status(
         select! {
             result = chan.next() => {
                 match result {
-                    Some(Ok(packet)) => {
-                        debug!("received c2s packet {:?}", packet.body);
-                        match packet.body {
-                            C2SStatusPacketBody::StatusRequest {} => {
+                    Some(Ok((length, packet))) => {
+                        debug!("received c2s packet {:?}", packet);
+                        match packet {
+                            C2SStatusPacket::StatusRequest {} => {
                                 info!("status request");
                                 chan.send(S2CStatusPacket::StatusResponse {
                                     json_response: json!({
@@ -853,7 +1073,7 @@ async fn state_status(
                                     }).to_string()
                                 }).await?;
                             }
-                            C2SStatusPacketBody::PingRequest { payload } => {
+                            C2SStatusPacket::PingRequest { payload } => {
                                 info!("ping request");
                                 chan.send(S2CStatusPacket::PingResponse { payload }).await?;
                             }
@@ -871,22 +1091,180 @@ async fn state_status(
     }
 }
 
-#[instrument(level = "info", name = "login", skip_all)]
-async fn state_login(
+#[instrument(level = "info", name = "login764", skip_all)]
+async fn state_login764(
     conn: &mut Connection,
-    chan: &mut Framed<TcpStream, LoginPacketCodec>,
+    chan: &mut Framed<TcpStream, LoginPacketCodec764>,
 ) -> Result<State> {
     loop {
         select! {
             result = chan.next() => {
                 match result {
-                    Some(Ok(packet)) => {
-                        debug!("received c2s packet {:?}", packet.body);
-                        match packet.body {
-                            C2SLoginPacketBody::LoginStart { name, player_uuid } => {
+                    Some(Ok((length, packet))) => {
+                        debug!("received c2s packet {:?}", packet);
+                        match packet {
+                            C2SLoginPacket764::LoginStart { name, player_uuid } => {
                                 info!("login start");
                                 conn.player_name = Some(name.to_string());
                                 conn.player_uuid = Some(player_uuid);
+                                chan.send(S2CLoginPacket::Disconnect {
+                                    reason: json!({
+                                        "translate": "multiplayer.disconnect.incompatible",
+                                        "with": [
+                                            "Minecraft: Dummy Edition"
+                                        ]
+                                    }).to_string()
+                                }).await?;
+                            },
+                        }
+                    }
+                    Some(Err(e)) => {
+                        bail!("error reading c2s packet: {}", e);
+                    },
+                    None => {
+                        return Ok(State::Disconnected);
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[instrument(level = "info", name = "login761", skip_all)]
+async fn state_login761(
+    conn: &mut Connection,
+    chan: &mut Framed<TcpStream, LoginPacketCodec761>,
+) -> Result<State> {
+    loop {
+        select! {
+            result = chan.next() => {
+                match result {
+                    Some(Ok((length, packet))) => {
+                        debug!("received c2s packet {:?}", packet);
+                        match packet {
+                            C2SLoginPacket761::LoginStart { name, has_player_uuid, player_uuid } => {
+                                info!("login start");
+                                conn.player_name = Some(name.to_string());
+                                if has_player_uuid {
+                                    conn.player_uuid = Some(player_uuid);
+                                }
+                                chan.send(S2CLoginPacket::Disconnect {
+                                    reason: json!({
+                                        "translate": "multiplayer.disconnect.incompatible",
+                                        "with": [
+                                            "Minecraft: Dummy Edition"
+                                        ]
+                                    }).to_string()
+                                }).await?;
+                            },
+                        }
+                    }
+                    Some(Err(e)) => {
+                        bail!("error reading c2s packet: {}", e);
+                    },
+                    None => {
+                        return Ok(State::Disconnected);
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[instrument(level = "info", name = "login760", skip_all)]
+async fn state_login760(
+    conn: &mut Connection,
+    chan: &mut Framed<TcpStream, LoginPacketCodec760>,
+) -> Result<State> {
+    loop {
+        select! {
+            result = chan.next() => {
+                match result {
+                    Some(Ok((length, packet))) => {
+                        debug!("received c2s packet {:?}", packet);
+                        match packet {
+                            C2SLoginPacket760::LoginStart {name,has_sig_data,timestamp,public_key_length,public_key,signature_length,signature, has_player_uuid, player_uuid } => {
+                                info!("login start");
+                                conn.player_name = Some(name.to_string());
+                                if has_player_uuid {
+                                    conn.player_uuid = Some(player_uuid);
+                                }
+                                chan.send(S2CLoginPacket::Disconnect {
+                                    reason: json!({
+                                        "translate": "multiplayer.disconnect.incompatible",
+                                        "with": [
+                                            "Minecraft: Dummy Edition"
+                                        ]
+                                    }).to_string()
+                                }).await?;
+                            },
+                        }
+                    }
+                    Some(Err(e)) => {
+                        bail!("error reading c2s packet: {}", e);
+                    },
+                    None => {
+                        return Ok(State::Disconnected);
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[instrument(level = "info", name = "login759", skip_all)]
+async fn state_login759(
+    conn: &mut Connection,
+    chan: &mut Framed<TcpStream, LoginPacketCodec759>,
+) -> Result<State> {
+    loop {
+        select! {
+            result = chan.next() => {
+                match result {
+                    Some(Ok((length, packet))) => {
+                        debug!("received c2s packet {:?}", packet);
+                        match packet {
+                            C2SLoginPacket759::LoginStart { name, has_sig_data, timestamp, public_key_length, public_key, signature_length, signature } => {
+                                info!("login start");
+                                conn.player_name = Some(name.to_string());
+                                chan.send(S2CLoginPacket::Disconnect {
+                                    reason: json!({
+                                        "translate": "multiplayer.disconnect.incompatible",
+                                        "with": [
+                                            "Minecraft: Dummy Edition"
+                                        ]
+                                    }).to_string()
+                                }).await?;
+                            },
+                        }
+                    }
+                    Some(Err(e)) => {
+                        bail!("error reading c2s packet: {}", e);
+                    },
+                    None => {
+                        return Ok(State::Disconnected);
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[instrument(level = "info", name = "login0", skip_all)]
+async fn state_login0(
+    conn: &mut Connection,
+    chan: &mut Framed<TcpStream, LoginPacketCodec0>,
+) -> Result<State> {
+    loop {
+        select! {
+            result = chan.next() => {
+                match result {
+                    Some(Ok((length, packet))) => {
+                        debug!("received c2s packet {:?}", packet);
+                        match packet {
+                            C2SLoginPacket0::LoginStart { name } => {
+                                info!("login start");
+                                conn.player_name = Some(name.to_string());
                                 chan.send(S2CLoginPacket::Disconnect {
                                     reason: json!({
                                         "translate": "multiplayer.disconnect.incompatible",
