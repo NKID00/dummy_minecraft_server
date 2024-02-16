@@ -1,0 +1,29 @@
+# server bind address
+bind_addr = "0.0.0.0:25565"
+
+# server version
+version = "Minecraft: Dummy Edition"
+
+# server description as json text component
+description = '{"text":"Minecraft: Dummy Edition"}'
+
+# number of maximum players
+player_max = -2147483648
+
+# number of online players
+player_online = -2147483648
+
+# 64x64 png favicon as base64'd data uri
+favicon = ""
+
+# disconnect reason as json text component
+disconnect_reason = '{"translate":"multiplayer.disconnect.incompatible","with":["Minecraft: Dummy Edition"]}'
+
+# sample of online players
+[[player_sample]]
+name = "jeb_"
+id = "853c80ef-3c37-49fd-aa49-938b674adae6"
+
+[[player_sample]]
+name = "Searage"
+id = "696a82ce-41f4-4b51-aa31-b8709b8686f0"

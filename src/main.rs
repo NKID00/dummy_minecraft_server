@@ -11,8 +11,11 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use eyre::{bail, Report, Result};
 use futures::{SinkExt, StreamExt};
 use paste::paste;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
+    fs::File,
+    io::AsyncReadExt,
     net::{TcpListener, TcpStream},
     select, spawn,
 };
@@ -523,7 +526,7 @@ macro_rules! impl_blank_decoder {
             type Item = ();
             type Error = Report;
 
-            fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
+            fn decode(&mut self, _src: &mut BytesMut) -> Result<Option<Self::Item>> {
                 unimplemented!("decoding is not supported");
             }
         }
@@ -858,9 +861,24 @@ struct BlankCodec;
 impl_blank_decoder!(BlankCodec);
 impl_blank_encoder!(BlankCodec);
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize)]
 pub struct Configuration {
-    pub addr: String,
+    pub bind_addr: String,
+    pub version: String,
+    pub description: String,
+    pub player_max: i32,
+    pub player_online: i32,
+    pub favicon: String,
+    pub disconnect_reason: String,
+    pub player_sample: Vec<PlayerSample>,
+    #[serde(skip)]
+    pub description_json: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlayerSample {
+    pub name: String,
+    pub id: String,
 }
 
 #[derive(Debug)]
@@ -889,7 +907,7 @@ pub enum State {
 #[instrument(level = "info", name = "", skip_all, fields(client = client_addr.to_string()))]
 async fn process_connection(conf: Arc<Configuration>, sock: TcpStream, client_addr: SocketAddr) {
     info!("connected");
-    if let Err(_) = sock.set_nodelay(true) {
+    if sock.set_nodelay(true).is_err() {
         error!("failed to set nodelay");
     }
     let mut conn = Connection {
@@ -1006,7 +1024,7 @@ async fn state_handshaking(
     select! {
         result = chan.next() => {
             match result {
-                Some(Ok((length, packet))) => {
+                Some(Ok((_length, packet))) => {
                     debug!("received c2s packet {:?}", packet);
                     match packet {
                         C2SHandshakingPacket::Handshake { protocol_version, server_address, server_port, next_state } => {
@@ -1052,7 +1070,7 @@ async fn state_status(
         select! {
             result = chan.next() => {
                 match result {
-                    Some(Ok((length, packet))) => {
+                    Some(Ok((_length, packet))) => {
                         debug!("received c2s packet {:?}", packet);
                         match packet {
                             C2SStatusPacket::StatusRequest {} => {
@@ -1060,16 +1078,15 @@ async fn state_status(
                                 chan.send(S2CStatusPacket::StatusResponse {
                                     json_response: json!({
                                         "version": {
-                                            "name":"Minecraft: Dummy Edition",
-                                            "protocol": conn.client_protocol_version
+                                            "name": conn.conf.version,
+                                            "protocol": conn.client_protocol_version,
                                         },
                                         "players": {
-                                            "max": -2147483648,
-                                            "online":-2147483648,
+                                            "max": conn.conf.player_max,
+                                            "online": conn.conf.player_online,
+                                            "sample": conn.conf.player_sample,
                                         },
-                                        "description": {
-                                            "text": "Minecraft: Dummy Edition"
-                                        }
+                                        "description": conn.conf.description_json,
                                     }).to_string()
                                 }).await?;
                             }
@@ -1100,7 +1117,7 @@ async fn state_login764(
         select! {
             result = chan.next() => {
                 match result {
-                    Some(Ok((length, packet))) => {
+                    Some(Ok((_length, packet))) => {
                         debug!("received c2s packet {:?}", packet);
                         match packet {
                             C2SLoginPacket764::LoginStart { name, player_uuid } => {
@@ -1108,12 +1125,7 @@ async fn state_login764(
                                 conn.player_name = Some(name.to_string());
                                 conn.player_uuid = Some(player_uuid);
                                 chan.send(S2CLoginPacket::Disconnect {
-                                    reason: json!({
-                                        "translate": "multiplayer.disconnect.incompatible",
-                                        "with": [
-                                            "Minecraft: Dummy Edition"
-                                        ]
-                                    }).to_string()
+                                    reason: conn.conf.disconnect_reason.clone()
                                 }).await?;
                             },
                         }
@@ -1139,7 +1151,7 @@ async fn state_login761(
         select! {
             result = chan.next() => {
                 match result {
-                    Some(Ok((length, packet))) => {
+                    Some(Ok((_length, packet))) => {
                         debug!("received c2s packet {:?}", packet);
                         match packet {
                             C2SLoginPacket761::LoginStart { name, has_player_uuid, player_uuid } => {
@@ -1149,12 +1161,7 @@ async fn state_login761(
                                     conn.player_uuid = Some(player_uuid);
                                 }
                                 chan.send(S2CLoginPacket::Disconnect {
-                                    reason: json!({
-                                        "translate": "multiplayer.disconnect.incompatible",
-                                        "with": [
-                                            "Minecraft: Dummy Edition"
-                                        ]
-                                    }).to_string()
+                                    reason: conn.conf.disconnect_reason.clone()
                                 }).await?;
                             },
                         }
@@ -1180,22 +1187,17 @@ async fn state_login760(
         select! {
             result = chan.next() => {
                 match result {
-                    Some(Ok((length, packet))) => {
+                    Some(Ok((_length, packet))) => {
                         debug!("received c2s packet {:?}", packet);
                         match packet {
-                            C2SLoginPacket760::LoginStart {name,has_sig_data,timestamp,public_key_length,public_key,signature_length,signature, has_player_uuid, player_uuid } => {
+                            C2SLoginPacket760::LoginStart { name, has_player_uuid, player_uuid, .. } => {
                                 info!("login start");
                                 conn.player_name = Some(name.to_string());
                                 if has_player_uuid {
                                     conn.player_uuid = Some(player_uuid);
                                 }
                                 chan.send(S2CLoginPacket::Disconnect {
-                                    reason: json!({
-                                        "translate": "multiplayer.disconnect.incompatible",
-                                        "with": [
-                                            "Minecraft: Dummy Edition"
-                                        ]
-                                    }).to_string()
+                                    reason: conn.conf.disconnect_reason.clone()
                                 }).await?;
                             },
                         }
@@ -1221,19 +1223,14 @@ async fn state_login759(
         select! {
             result = chan.next() => {
                 match result {
-                    Some(Ok((length, packet))) => {
+                    Some(Ok((_length, packet))) => {
                         debug!("received c2s packet {:?}", packet);
                         match packet {
-                            C2SLoginPacket759::LoginStart { name, has_sig_data, timestamp, public_key_length, public_key, signature_length, signature } => {
+                            C2SLoginPacket759::LoginStart { name, .. } => {
                                 info!("login start");
                                 conn.player_name = Some(name.to_string());
                                 chan.send(S2CLoginPacket::Disconnect {
-                                    reason: json!({
-                                        "translate": "multiplayer.disconnect.incompatible",
-                                        "with": [
-                                            "Minecraft: Dummy Edition"
-                                        ]
-                                    }).to_string()
+                                    reason: conn.conf.disconnect_reason.clone()
                                 }).await?;
                             },
                         }
@@ -1259,19 +1256,14 @@ async fn state_login0(
         select! {
             result = chan.next() => {
                 match result {
-                    Some(Ok((length, packet))) => {
+                    Some(Ok((_length, packet))) => {
                         debug!("received c2s packet {:?}", packet);
                         match packet {
                             C2SLoginPacket0::LoginStart { name } => {
                                 info!("login start");
                                 conn.player_name = Some(name.to_string());
                                 chan.send(S2CLoginPacket::Disconnect {
-                                    reason: json!({
-                                        "translate": "multiplayer.disconnect.incompatible",
-                                        "with": [
-                                            "Minecraft: Dummy Edition"
-                                        ]
-                                    }).to_string()
+                                    reason: conn.conf.disconnect_reason.clone()
                                 }).await?;
                             },
                         }
@@ -1290,9 +1282,15 @@ async fn state_login0(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let conf = Configuration {
-        addr: "0.0.0.0:25565".to_string(),
-    };
+    let mut conf_string = String::new();
+    File::open("dummy_minecraft_server.toml")
+        .await
+        .unwrap()
+        .read_to_string(&mut conf_string)
+        .await
+        .unwrap();
+    let mut conf: Configuration = toml::from_str(&conf_string).unwrap();
+    conf.description_json = serde_json::from_str(&conf.description).unwrap();
     let conf = Arc::new(conf);
     if cfg!(debug_assertions) {
         tracing_subscriber::fmt()
@@ -1309,8 +1307,8 @@ async fn main() -> Result<()> {
             .init();
     }
     debug!("starting up");
-    let listener = TcpListener::bind(conf.addr.as_str()).await?;
-    info!("listening on {}", conf.addr.as_str());
+    let listener = TcpListener::bind(conf.bind_addr.as_str()).await?;
+    info!("listening on {}", conf.bind_addr.as_str());
     loop {
         let (sock, client_addr) = listener.accept().await?;
         spawn(process_connection(conf.clone(), sock, client_addr));
